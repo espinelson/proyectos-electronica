@@ -1,0 +1,201 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- CONFIGURACIÓN DE PANTALLA LCD ---
+// Dirección I2C típica: 0x27 o 0x3F. Pantalla de 16 columnas x 2 filas.
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- PINOUT ---
+const int PIN_CAUDALIMETRO   = 2;   // Debe ser un pin con interrupción (Digital 2 en Arduino)
+const int PIN_MONEDERO       = 3;   // Entrada de pulsos del monedero (Digital 3 en Arduino)
+const int PIN_BOTON_DESPACHO = 4;   // Botón para iniciar el llenado
+const int PIN_BOTON_PAUSA    = 5;   // Botón de pausa / emergencia
+const int PIN_BOMBA          = 8;   // Salida al relevador de la bomba
+const int PIN_ELECTROVALVULA = 9;   // Salida al relevador de la electroválvula
+const int PIN_SENSOR_PRESION = 10;  // Entrada del sensor de presión/nivel (High = Hay agua)
+
+// --- VARIABLES GLOBALES DE CONTROL ---
+enum EstadoSistema { IDLE, CREDITO_INGRESADO, DESPACHANDO, PAUSADO, ERROR_AGUA };
+EstadoSistema estadoActual = IDLE;
+
+// Monedero y Crédito
+volatile float creditoActual = 0.0;
+const float VALOR_POR_PULSO = 1.0; // Ajusta según la configuración de tu monedero (ej: $1 por pulso)
+
+// Caudalímetro y Volúmenes
+volatile unsigned long pulsosCaudalimetro = 0;
+const float FACTOR_CALIBRACION = 450.0; // Pulsos por litro (ajustar según calibración real)
+float volumenObjetivo = 19.0;           // Volumen a despachar en litros (ej: Garrafón de 19L)
+float volumenDespachado = 0.0;
+
+// Variables para control de rebotes (Debounce) y tiempos
+unsigned long ultimoTiempoPulsoMoneda = 0;
+const unsigned long DEBOUNCE_MONEDA = 50; 
+unsigned long tiempoUltimaPantalla = 0;
+
+// --- RUTINAS DE INTERRUPCIÓN (ISR) ---
+void ICACHE_RAM_ATTR isrMonedero() {
+  unsigned long tiempoActual = millis();
+  if (tiempoActual - ultimoTiempoPulsoMoneda > DEBOUNCE_MONEDA) {
+    creditoActual += VALOR_POR_PULSO;
+    ultimoTiempoPulsoMoneda = tiempoActual;
+  }
+}
+
+void ICACHE_RAM_ATTR isrCaudalimetro() {
+  pulsosCaudalimetro++;
+}
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(9600);
+
+  // Configuración de Pines
+  pinMode(PIN_CAUDALIMETRO, INPUT_PULLUP);
+  pinMode(PIN_MONEDERO, INPUT_PULLUP);
+  pinMode(PIN_BOTON_DESPACHO, INPUT_PULLUP);
+  pinMode(PIN_BOTON_PAUSA, INPUT_PULLUP);
+  pinMode(PIN_SENSOR_PRESION, INPUT);
+
+  pinMode(PIN_BOMBA, OUTPUT);
+  pinMode(PIN_ELECTROVALVULA, OUTPUT);
+
+  // Asegurar que los actuadores inicien apagados (Lógica inversa común en módulos de relevadores)
+  digitalWrite(PIN_BOMBA, HIGH); 
+  digitalWrite(PIN_ELECTROVALVULA, HIGH);
+
+  // Inicialización de LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("  PURIFICADORA  ");
+  lcd.setCursor(0, 1);
+  lcd.print("   VENDING 24H  ");
+  delay(2000);
+
+  // Adjuntar Interrupciones
+  attachInterrupt(digitalPinToInterrupt(PIN_MONEDERO), isrMonedero, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_CAUDALIMETRO), isrCaudalimetro, RISING);
+
+  lcd.clear();
+}
+
+// --- BUCLE PRINCIPAL ---
+void loop() {
+  // Verificación constante de seguridad: Si no hay agua, se detiene todo
+  if (digitalRead(PIN_SENSOR_PRESION) == LOW && estadoActual != ERROR_AGUA) {
+    apagarActuadores();
+    estadoActual = ERROR_AGUA;
+  }
+
+  // Máquina de Estados
+  switch (estadoActual) {
+    
+    case IDLE:
+      actualizarPantalla(" Deposite Monedas", "Credito: $" + String(creditoActual, 2));
+      apagarActuadores();
+      
+      if (creditoActual > 0.0) {
+        estadoActual = CREDITO_INGRESADO;
+      }
+      break;
+
+    case CREDITO_INGRESADO:
+      actualizarPantalla("Presione Llenar", "Credito: $" + String(creditoActual, 2));
+      
+      if (digitalRead(PIN_BOTON_DESPACHO) == LOW) {
+        // Aquí podrías restar el costo del garrafón al crédito
+        // Por ahora, iniciamos el conteo de flujo de manera limpia
+        noInterrupts();
+        pulsosCaudalimetro = 0;
+        interrupts();
+        volumenDespachado = 0.0;
+        
+        prenderActuadores();
+        estadoActual = DESPACHANDO;
+      }
+      break;
+
+    case DESPACHANDO:
+      // Calcular volumen actual medido por el caudalímetro
+      noInterrupts();
+      unsigned long copiaPulsos = pulsosCaudalimetro;
+      interrupts();
+      
+      volumenDespachado = copiaPulsos / FACTOR_CALIBRACION;
+      
+      actualizarPantalla("Llenando...", "Vol: " + String(volumenDespachado, 1) + "L / " + String(volumenObjetivo, 0) + "L");
+
+      // Verificar si se alcanzó el volumen objetivo
+      if (volumenDespachado >= volumenObjetivo) {
+        apagarActuadores();
+        creditoActual = 0.0; // Reiniciar o ajustar crédito restante
+        lcd.clear();
+        lcd.print(" Llenado Exitoso");
+        lcd.setCursor(0, 1);
+        lcd.print("   Gracias!     ");
+        delay(3000);
+        estadoActual = IDLE;
+      }
+
+      // Verificar si el usuario presiona Pausa
+      if (digitalRead(PIN_BOTON_PAUSA) == LOW) {
+        apagarActuadores();
+        delay(300); // Evitar rebotes mecánicos
+        estadoActual = PAUSADO;
+      }
+      break;
+
+    case PAUSADO:
+      actualizarPantalla("  Venta Pausada ", "Boton Llenar=Ver");
+      
+      // Si vuelve a presionar despacho, reanuda
+      if (digitalRead(PIN_BOTON_DESPACHO) == LOW) {
+        prenderActuadores();
+        delay(300);
+        estadoActual = DESPACHANDO;
+      }
+      break;
+
+    case ERROR_AGUA:
+      actualizarPantalla("  FALTA DE AGUA ", " Fuera de Servicio");
+      apagarActuadores();
+      
+      // Si el sensor detecta que regresó el agua, vuelve a IDLE
+      if (digitalRead(PIN_SENSOR_PRESION) == HIGH) {
+        lcd.clear();
+        estadoActual = IDLE;
+      }
+      break;
+  }
+}
+
+// --- FUNCIONES AUXILIARES ---
+
+void prenderActuadores() {
+  // Lógica LOW para activar módulos de relevadores comunes
+  digitalWrite(PIN_ELECTROVALVULA, LOW);
+  delay(200); // Pequeño desfase para evitar picos de corriente concurrentes
+  digitalWrite(PIN_BOMBA, LOW);
+}
+
+void apagarActuadores() {
+  digitalWrite(PIN_BOMBA, HIGH);
+  digitalWrite(PIN_ELECTROVALVULA, HIGH);
+}
+
+// Función para refrescar la pantalla sin causar parpadeos molestos (flicker)
+void actualizarPantalla(String linea1, String linea2) {
+  if (millis() - tiempoUltimaPantalla > 250) { // Refresca cada 250ms
+    lcd.setCursor(0, 0);
+    // Rellenar con espacios vacíos para limpiar caracteres viejos
+    while (linea1.length() < 16) linea1 += " ";
+    lcd.print(linea1);
+    
+    lcd.setCursor(0, 1);
+    while (linea2.length() < 16) linea2 += " ";
+    lcd.print(linea2);
+    
+    tiempoUltimaPantalla = millis();
+  }
+}
